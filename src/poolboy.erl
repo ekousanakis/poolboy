@@ -36,8 +36,16 @@
     size = 5 :: non_neg_integer(),
     overflow = 0 :: non_neg_integer(),
     max_overflow = 10 :: non_neg_integer(),
-    strategy = lifo :: lifo | fifo
+    strategy = lifo :: lifo | fifo | weighted
 }).
+
+-spec sort(Workers :: list(), Sorted :: list()) -> list().
+sort([Head | Tail], Sorted) ->
+    Channels = 'Elixir.ExRabbitMQ.Connection':'get_channels'(Head),
+    Tmp = lists:sort(fun({KeyA, ValA}, {KeyB, ValB}) -> {ValA, KeyA} =< {ValB, KeyB} end, [ {Head, Channels} | Sorted]),
+    sort(Tail, Tmp);
+sort([], Sorted) ->
+    Sorted.
 
 -spec checkout(Pool :: pool()) -> pid().
 checkout(Pool) ->
@@ -182,12 +190,9 @@ handle_call({checkout, CRef, Block}, {FromPid, _} = From, State) ->
            workers = Workers,
            monitors = Monitors,
            overflow = Overflow,
+           strategy = Strategy,
            max_overflow = MaxOverflow} = State,
     case Workers of
-        [Pid | Left] ->
-            MRef = erlang:monitor(process, FromPid),
-            true = ets:insert(Monitors, {Pid, CRef, MRef}),
-            {reply, Pid, State#state{workers = Left}};
         [] when MaxOverflow > 0, Overflow < MaxOverflow ->
             {Pid, MRef} = new_worker(Sup, FromPid),
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
@@ -197,7 +202,16 @@ handle_call({checkout, CRef, Block}, {FromPid, _} = From, State) ->
         [] ->
             MRef = erlang:monitor(process, FromPid),
             Waiting = queue:in({From, CRef, MRef}, State#state.waiting),
-            {noreply, State#state{waiting = Waiting}}
+            {noreply, State#state{waiting = Waiting}};
+        [Pid | Left] when Strategy == lifo, Strategy==fifo ->
+            % sort([Pid | Left], []),
+            MRef = erlang:monitor(process, FromPid),
+            true = ets:insert(Monitors, {Pid, CRef, MRef}),
+            {reply, Pid, State#state{workers = Left}}
+        % _ -> %Elixir.ExRabbitMQ.Connection':'get_channels'(),
+        %     MRef = erlang:monitor(process, FromPid),
+        %     true = ets:insert(Monitors, {Pid, CRef, MRef}),
+        %     {reply, Pid, State#state{workers = Left}}
     end;
 
 handle_call(status, _From, State) ->
@@ -312,6 +326,7 @@ handle_checkin(Pid, State) ->
         {empty, Empty} ->
             Workers = case Strategy of
                 lifo -> [Pid | State#state.workers];
+                weighted -> [Pid | State#state.workers];
                 fifo -> State#state.workers ++ [Pid]
             end,
             State#state{workers = Workers, waiting = Empty, overflow = 0}
